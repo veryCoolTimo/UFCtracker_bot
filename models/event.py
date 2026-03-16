@@ -70,7 +70,7 @@ class Event:
             fights=fights
         )
 
-    def format_message(self, timezone_str: str = "Europe/Moscow") -> str:
+    def format_message(self, timezone_str: str = "CET") -> str:
         """Форматирует событие для отправки в Telegram."""
         from zoneinfo import ZoneInfo
         from config import MMA_LEAGUES
@@ -78,22 +78,27 @@ class Event:
         tz = ZoneInfo(timezone_str)
         local_date = self.date.astimezone(tz)
 
-        # Форматирование даты на русском
+        # Форматирование даты
         months = [
-            "", "января", "февраля", "марта", "апреля", "мая", "июня",
-            "июля", "августа", "сентября", "октября", "ноября", "декабря"
+            "", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
         ]
         date_str = f"{local_date.day} {months[local_date.month]} {local_date.year}"
         time_str = local_date.strftime("%H:%M")
 
-        # Получаем emoji для лиги
+        # Определяем название таймзоны
+        tz_name = "CET" if timezone_str in ("CET", "Europe/Berlin", "Europe/Paris") else timezone_str
+
+        # Получаем инфо о лиге
         league_info = MMA_LEAGUES.get(self.league, {})
         emoji = league_info.get("emoji", "🥊")
+        watch_list = league_info.get("watch", [])
+        official_url = league_info.get("official_url", "")
 
         lines = [
             f"{emoji} <b>{self.name}</b>",
             "",
-            f"📅 {date_str}, {time_str} (МСК)",
+            f"📅 {date_str}, {time_str} ({tz_name})",
         ]
 
         if self.venue or self.location:
@@ -107,17 +112,32 @@ class Event:
         if self.main_event:
             lines.extend([
                 "",
-                "🎯 <b>Главный бой:</b>",
+                "🎯 <b>Main Event:</b>",
                 f"{self.main_event.fighter1} vs {self.main_event.fighter2}"
             ])
             if self.main_event.weight_class:
                 title_text = " (Title)" if self.main_event.is_title_fight else ""
                 lines.append(f"({self.main_event.weight_class}{title_text})")
 
-        if self.url:
+        # Где смотреть
+        if watch_list:
             lines.extend([
                 "",
-                f"🔗 <a href=\"{self.url}\">Подробнее</a>"
+                "📺 <b>Where to watch:</b>",
+                " | ".join(watch_list)
+            ])
+
+        # Ссылки
+        links = []
+        if self.url:
+            links.append(f"<a href=\"{self.url}\">ESPN</a>")
+        if official_url:
+            links.append(f"<a href=\"{official_url}\">Official</a>")
+
+        if links:
+            lines.extend([
+                "",
+                f"🔗 {' • '.join(links)}"
             ])
 
         return "\n".join(lines)
