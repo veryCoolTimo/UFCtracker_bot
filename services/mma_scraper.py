@@ -1,10 +1,8 @@
 import aiohttp
 import asyncio
 import logging
-from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 from typing import Optional
-import re
 import hashlib
 
 from models.event import Event, Fight
@@ -12,14 +10,21 @@ from config import MMA_LEAGUES
 
 logger = logging.getLogger(__name__)
 
+# ESPN API endpoints
+ESPN_API_BASE = "https://site.api.espn.com/apis/site/v2/sports/mma"
+ESPN_API_URLS = {
+    "UFC": f"{ESPN_API_BASE}/ufc/scoreboard",
+    "Bellator": f"{ESPN_API_BASE}/bellator/scoreboard",
+    "PFL": f"{ESPN_API_BASE}/pfl/scoreboard",
+}
+
 
 class MMAScraper:
-    """Парсер событий MMA с ESPN для всех лиг."""
+    """Парсер событий MMA через ESPN API."""
 
     HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept": "application/json",
     }
 
     def __init__(self):
@@ -33,307 +38,154 @@ class MMAScraper:
         if self.session:
             await self.session.close()
 
-    def _generate_event_id(self, name: str, date: datetime, league: str) -> str:
+    def _generate_event_id(self, espn_id: str, league: str) -> str:
         """Генерирует уникальный ID для события."""
-        unique_string = f"{league}_{name}_{date.isoformat()}"
-        return hashlib.md5(unique_string.encode()).hexdigest()[:12]
+        return f"{league.lower()}_{espn_id}"
 
-    def _parse_date(self, date_str: str) -> Optional[datetime]:
-        """Парсит строку даты в datetime."""
+    def _parse_date(self, date_str: str) -> datetime:
+        """Парсит ISO дату."""
         try:
-            formats = [
-                "%a, %b %d",  # Sat, Apr 12
-                "%B %d, %Y",  # April 12, 2026
-                "%b %d, %Y",  # Apr 12, 2026
-                "%b %d",      # Apr 12
-                "%Y-%m-%dT%H:%M:%SZ",  # ISO format
-                "%Y-%m-%dT%H:%M:%S",
-            ]
+            # Формат: 2026-03-21T17:00Z
+            return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        except:
+            return datetime.now(timezone.utc)
 
-            for fmt in formats:
-                try:
-                    parsed = datetime.strptime(date_str.strip(), fmt)
-                    if parsed.year == 1900:
-                        now = datetime.now()
-                        parsed = parsed.replace(year=now.year)
-                        if parsed < now:
-                            parsed = parsed.replace(year=now.year + 1)
-                    return parsed.replace(tzinfo=timezone.utc)
-                except ValueError:
-                    continue
-
-            logger.debug(f"Не удалось распарсить дату: {date_str}")
-            return None
-        except Exception as e:
-            logger.error(f"Ошибка парсинга даты {date_str}: {e}")
-            return None
+    def _parse_fight_from_name(self, event_name: str) -> Optional[Fight]:
+        """Парсит main event из названия события."""
+        import re
+        # Паттерн: "UFC Fight Night: Evloev vs. Murphy"
+        match = re.search(r":\s*([A-Za-z\'\-\.\s]+?)\s+vs\.?\s+([A-Za-z\'\-\.\s]+?)$", event_name, re.IGNORECASE)
+        if match:
+            return Fight(fighter1=match.group(1).strip(), fighter2=match.group(2).strip())
+        return None
 
     async def fetch_league_events(self, league_key: str) -> list[Event]:
-        """Получает события для одной лиги."""
+        """Получает события для одной лиги через ESPN API."""
         if not self.session:
             raise RuntimeError("Scraper должен использоваться как context manager")
 
-        league_info = MMA_LEAGUES.get(league_key)
-        if not league_info:
-            logger.error(f"Неизвестная лига: {league_key}")
+        api_url = ESPN_API_URLS.get(league_key)
+        if not api_url:
+            logger.warning(f"Нет API URL для лиги: {league_key}")
             return []
 
-        url = league_info["url"]
-        league_name = league_info["name"]
         events = []
 
         try:
-            async with self.session.get(url) as response:
+            async with self.session.get(api_url) as response:
                 if response.status != 200:
-                    logger.error(f"ESPN вернул статус {response.status} для {league_key}")
+                    logger.error(f"ESPN API вернул статус {response.status} для {league_key}")
                     return events
 
-                html = await response.text()
-                soup = BeautifulSoup(html, "lxml")
+                data = await response.json()
 
-                # Ищем таблицы расписания
-                schedule_tables = soup.find_all("div", class_="ResponsiveTable")
-                if not schedule_tables:
-                    schedule_tables = soup.find_all("table", class_="Table")
-
-                for table in schedule_tables:
-                    rows = table.find_all("tr")
-                    current_date = None
-
-                    for row in rows:
-                        date_header = row.find("td", class_="Table__Title")
-                        if date_header:
-                            current_date = self._parse_date(date_header.get_text(strip=True))
-                            continue
-
-                        cells = row.find_all("td")
-                        if len(cells) >= 2:
-                            event = self._parse_event_row(cells, current_date, league_key)
-                            if event:
-                                events.append(event)
-
-                # Альтернативный парсинг
-                if not events:
-                    events = self._parse_event_cards(soup, league_key)
+                for event_data in data.get("events", []):
+                    event = self._parse_event(event_data, league_key)
+                    if event:
+                        events.append(event)
 
         except aiohttp.ClientError as e:
             logger.error(f"Ошибка сети при запросе {league_key}: {e}")
         except Exception as e:
             logger.error(f"Ошибка парсинга {league_key}: {e}")
 
-        logger.info(f"Найдено {len(events)} событий {league_name}")
+        logger.info(f"Найдено {len(events)} событий {league_key}")
         return events
 
-    def _parse_event_row(self, cells, current_date: Optional[datetime], league: str) -> Optional[Event]:
-        """Парсит строку таблицы в событие."""
+    def _parse_event(self, data: dict, league: str) -> Optional[Event]:
+        """Парсит событие из JSON данных ESPN API."""
         try:
-            name_cell = cells[0]
-            name_link = name_cell.find("a")
+            espn_id = data.get("id", "")
+            name = data.get("name", "")
+            date_str = data.get("date", "")
 
-            if name_link:
-                name = name_link.get_text(strip=True)
-                url = name_link.get("href", "")
-                if url and not url.startswith("http"):
-                    url = f"https://www.espn.com{url}"
-            else:
-                name = name_cell.get_text(strip=True)
-                url = ""
-
-            if not name:
+            if not name or not date_str:
                 return None
 
-            # Ищем дату
-            event_date = current_date
-            for cell in cells:
-                text = cell.get_text(strip=True)
-                parsed_date = self._parse_date(text)
-                if parsed_date:
-                    event_date = parsed_date
-                    break
+            event_date = self._parse_date(date_str)
 
-            if not event_date:
-                event_date = datetime.now(timezone.utc)
-
-            # Ищем локацию
+            # Получаем локацию из первого competition
             location = ""
-            for cell in cells[1:]:
-                text = cell.get_text(strip=True)
-                if "," in text and not self._parse_date(text):
-                    location = text
-                    break
+            venue = ""
+            competitions = data.get("competitions", [])
 
-            event_id = self._generate_event_id(name, event_date, league)
+            # Ищем main event (обычно первый бой в списке с самым высоким billing)
+            main_event = None
+            main_event_fights = []
+
+            for comp in competitions:
+                # Venue
+                venue_data = comp.get("venue", {})
+                if venue_data and not venue:
+                    venue = venue_data.get("fullName", "")
+                    addr = venue_data.get("address", {})
+                    city = addr.get("city", "")
+                    country = addr.get("country", "")
+                    if city:
+                        location = f"{city}, {country}" if country else city
+
+                # Competitors (fighters)
+                competitors = comp.get("competitors", [])
+                if len(competitors) >= 2:
+                    fighter1_data = competitors[0].get("athlete", {})
+                    fighter2_data = competitors[1].get("athlete", {})
+
+                    f1_name = fighter1_data.get("displayName", "")
+                    f2_name = fighter2_data.get("displayName", "")
+
+                    # Records
+                    f1_record = ""
+                    f2_record = ""
+
+                    for rec in competitors[0].get("records", []):
+                        if rec.get("type") == "total":
+                            f1_record = rec.get("summary", "")
+                            break
+
+                    for rec in competitors[1].get("records", []):
+                        if rec.get("type") == "total":
+                            f2_record = rec.get("summary", "")
+                            break
+
+                    if f1_name and f2_name:
+                        fight = Fight(
+                            fighter1=f1_name,
+                            fighter2=f2_name,
+                            weight_class=comp.get("type", {}).get("abbreviation", "")
+                        )
+                        main_event_fights.append(fight)
+
+            # Парсим main event из названия события (более надёжно)
+            main_event = self._parse_fight_from_name(name)
+
+            # Если не удалось - берём последний бой (main event обычно в конце)
+            if not main_event and main_event_fights:
+                main_event = main_event_fights[-1]
+
+            # URL события
+            url = f"https://www.espn.com/mma/fightcenter/_/id/{espn_id}/league/{league.lower()}"
 
             return Event(
-                id=event_id,
+                id=self._generate_event_id(espn_id, league),
                 name=name,
                 date=event_date,
                 league=league,
                 location=location,
-                url=url
+                venue=venue,
+                url=url,
+                main_event=main_event,
+                fights=main_event_fights[:5]  # Первые 5 боёв
             )
+
         except Exception as e:
-            logger.error(f"Ошибка парсинга строки события: {e}")
+            logger.error(f"Ошибка парсинга события: {e}")
             return None
-
-    def _parse_event_cards(self, soup: BeautifulSoup, league: str) -> list[Event]:
-        """Альтернативный парсинг через карточки событий."""
-        events = []
-        cards = soup.find_all("article") or soup.find_all("div", class_=re.compile(r"event|card", re.I))
-
-        for card in cards:
-            try:
-                title = card.find(["h1", "h2", "h3", "a"])
-                if not title:
-                    continue
-
-                name = title.get_text(strip=True)
-                if not name:
-                    continue
-
-                link = card.find("a")
-                url = ""
-                if link and link.get("href"):
-                    url = link["href"]
-                    if not url.startswith("http"):
-                        url = f"https://www.espn.com{url}"
-
-                date_elem = card.find(class_=re.compile(r"date|time", re.I))
-                event_date = datetime.now(timezone.utc)
-                if date_elem:
-                    parsed = self._parse_date(date_elem.get_text(strip=True))
-                    if parsed:
-                        event_date = parsed
-
-                location = ""
-                location_elem = card.find(class_=re.compile(r"location|venue", re.I))
-                if location_elem:
-                    location = location_elem.get_text(strip=True)
-
-                event_id = self._generate_event_id(name, event_date, league)
-
-                events.append(Event(
-                    id=event_id,
-                    name=name,
-                    date=event_date,
-                    league=league,
-                    location=location,
-                    url=url
-                ))
-            except Exception as e:
-                logger.debug(f"Ошибка парсинга карточки: {e}")
-                continue
-
-        return events
-
-    async def fetch_event_details(self, event: Event) -> Event:
-        """Получает детали события (main event, fight card)."""
-        if not self.session or not event.url:
-            return event
-
-        try:
-            async with self.session.get(event.url) as response:
-                if response.status != 200:
-                    return event
-
-                html = await response.text()
-                soup = BeautifulSoup(html, "lxml")
-
-                # Пробуем найти main event разными способами
-
-                # Способ 1: Ищем заголовок с именами бойцов
-                headline = soup.find("h1", class_=re.compile(r"headline", re.I))
-                if headline:
-                    text = headline.get_text(strip=True)
-                    fight = self._parse_fight_from_text(text)
-                    if fight:
-                        event.main_event = fight
-
-                # Способ 2: Ищем секцию с боями
-                if not event.main_event:
-                    fight_sections = soup.find_all(class_=re.compile(r"fight|matchup|bout", re.I))
-                    for section in fight_sections:
-                        fighters = section.find_all(class_=re.compile(r"fighter|name|competitor", re.I))
-                        if len(fighters) >= 2:
-                            f1 = fighters[0].get_text(strip=True)
-                            f2 = fighters[1].get_text(strip=True)
-                            if f1 and f2:
-                                event.main_event = Fight(fighter1=f1, fighter2=f2)
-                                break
-
-                # Способ 3: Ищем в названии события
-                if not event.main_event:
-                    fight = self._parse_fight_from_text(event.name)
-                    if fight:
-                        event.main_event = fight
-
-                # Способ 4: Ищем ссылки на бойцов
-                if not event.main_event:
-                    fighter_links = soup.find_all("a", href=re.compile(r"/mma/fighter/", re.I))
-                    if len(fighter_links) >= 2:
-                        f1 = fighter_links[0].get_text(strip=True)
-                        f2 = fighter_links[1].get_text(strip=True)
-                        if f1 and f2 and f1 != f2:
-                            event.main_event = Fight(fighter1=f1, fighter2=f2)
-
-                # Ищем venue/location
-                venue_elem = soup.find(class_=re.compile(r"venue|location|arena", re.I))
-                if venue_elem and not event.venue:
-                    event.venue = venue_elem.get_text(strip=True)
-
-        except Exception as e:
-            logger.debug(f"Ошибка получения деталей события {event.name}: {e}")
-
-        return event
-
-    def _parse_fight_from_text(self, text: str) -> Optional[Fight]:
-        """Парсит имена бойцов из текста."""
-        # Паттерны: "Fighter1 vs Fighter2", "Fighter1 vs. Fighter2", "Fighter1 v Fighter2"
-        patterns = [
-            r"([A-Za-z\'\-\.\s]+?)\s+vs\.?\s+([A-Za-z\'\-\.\s]+)",
-            r"([A-Za-z\'\-\.\s]+?)\s+v\s+([A-Za-z\'\-\.\s]+)",
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                f1 = match.group(1).strip()
-                f2 = match.group(2).strip()
-
-                # Убираем лишние слова
-                for word in ["UFC", "PFL", "Bellator", "Fight Night", "Main Event", ":", "-"]:
-                    f1 = f1.replace(word, "").strip()
-                    f2 = f2.replace(word, "").strip()
-
-                if f1 and f2 and len(f1) > 2 and len(f2) > 2:
-                    # Определяем title fight
-                    is_title = "title" in text.lower() or "championship" in text.lower()
-
-                    # Ищем весовую категорию
-                    weight_class = ""
-                    weight_patterns = [
-                        r"(Lightweight|Welterweight|Middleweight|Heavyweight|Featherweight|Bantamweight|Flyweight|Light Heavyweight|Strawweight|Women's)",
-                    ]
-                    for wp in weight_patterns:
-                        wm = re.search(wp, text, re.IGNORECASE)
-                        if wm:
-                            weight_class = wm.group(1)
-                            break
-
-                    return Fight(
-                        fighter1=f1,
-                        fighter2=f2,
-                        weight_class=weight_class,
-                        is_title_fight=is_title
-                    )
-
-        return None
 
     async def fetch_all_events(self) -> list[Event]:
         """Получает события со всех лиг параллельно."""
         tasks = [
             self.fetch_league_events(league_key)
-            for league_key in MMA_LEAGUES.keys()
+            for league_key in ESPN_API_URLS.keys()
         ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -348,17 +200,19 @@ class MMAScraper:
         return all_events
 
 
-async def get_upcoming_events(leagues: list[str] = None, fetch_details: bool = True) -> list[Event]:
+async def get_upcoming_events(leagues: list[str] = None, fetch_details: bool = False) -> list[Event]:
     """
     Получает предстоящие события MMA.
 
     Args:
         leagues: Список лиг для получения (по умолчанию все)
-        fetch_details: Загружать ли детали событий (main event)
+        fetch_details: Не используется (данные уже полные из API)
     """
     async with MMAScraper() as scraper:
         if leagues:
-            tasks = [scraper.fetch_league_events(league) for league in leagues]
+            # Фильтруем только поддерживаемые лиги
+            valid_leagues = [l for l in leagues if l in ESPN_API_URLS]
+            tasks = [scraper.fetch_league_events(league) for league in valid_leagues]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             events = []
             for result in results:
@@ -373,17 +227,5 @@ async def get_upcoming_events(leagues: list[str] = None, fetch_details: bool = T
 
         # Сортируем по дате
         upcoming.sort(key=lambda e: e.date)
-
-        # Загружаем детали для первых N событий
-        if fetch_details and upcoming:
-            # Загружаем детали для первых 5 событий параллельно
-            events_to_fetch = upcoming[:5]
-            detail_tasks = [scraper.fetch_event_details(e) for e in events_to_fetch]
-            detailed_events = await asyncio.gather(*detail_tasks, return_exceptions=True)
-
-            # Заменяем события с деталями
-            for i, result in enumerate(detailed_events):
-                if isinstance(result, Event):
-                    upcoming[i] = result
 
         return upcoming
