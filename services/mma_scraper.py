@@ -46,6 +46,8 @@ class MMAScraper:
                 "%B %d, %Y",  # April 12, 2026
                 "%b %d, %Y",  # Apr 12, 2026
                 "%b %d",      # Apr 12
+                "%Y-%m-%dT%H:%M:%SZ",  # ISO format
+                "%Y-%m-%dT%H:%M:%S",
             ]
 
             for fmt in formats:
@@ -224,6 +226,109 @@ class MMAScraper:
 
         return events
 
+    async def fetch_event_details(self, event: Event) -> Event:
+        """Получает детали события (main event, fight card)."""
+        if not self.session or not event.url:
+            return event
+
+        try:
+            async with self.session.get(event.url) as response:
+                if response.status != 200:
+                    return event
+
+                html = await response.text()
+                soup = BeautifulSoup(html, "lxml")
+
+                # Пробуем найти main event разными способами
+
+                # Способ 1: Ищем заголовок с именами бойцов
+                headline = soup.find("h1", class_=re.compile(r"headline", re.I))
+                if headline:
+                    text = headline.get_text(strip=True)
+                    fight = self._parse_fight_from_text(text)
+                    if fight:
+                        event.main_event = fight
+
+                # Способ 2: Ищем секцию с боями
+                if not event.main_event:
+                    fight_sections = soup.find_all(class_=re.compile(r"fight|matchup|bout", re.I))
+                    for section in fight_sections:
+                        fighters = section.find_all(class_=re.compile(r"fighter|name|competitor", re.I))
+                        if len(fighters) >= 2:
+                            f1 = fighters[0].get_text(strip=True)
+                            f2 = fighters[1].get_text(strip=True)
+                            if f1 and f2:
+                                event.main_event = Fight(fighter1=f1, fighter2=f2)
+                                break
+
+                # Способ 3: Ищем в названии события
+                if not event.main_event:
+                    fight = self._parse_fight_from_text(event.name)
+                    if fight:
+                        event.main_event = fight
+
+                # Способ 4: Ищем ссылки на бойцов
+                if not event.main_event:
+                    fighter_links = soup.find_all("a", href=re.compile(r"/mma/fighter/", re.I))
+                    if len(fighter_links) >= 2:
+                        f1 = fighter_links[0].get_text(strip=True)
+                        f2 = fighter_links[1].get_text(strip=True)
+                        if f1 and f2 and f1 != f2:
+                            event.main_event = Fight(fighter1=f1, fighter2=f2)
+
+                # Ищем venue/location
+                venue_elem = soup.find(class_=re.compile(r"venue|location|arena", re.I))
+                if venue_elem and not event.venue:
+                    event.venue = venue_elem.get_text(strip=True)
+
+        except Exception as e:
+            logger.debug(f"Ошибка получения деталей события {event.name}: {e}")
+
+        return event
+
+    def _parse_fight_from_text(self, text: str) -> Optional[Fight]:
+        """Парсит имена бойцов из текста."""
+        # Паттерны: "Fighter1 vs Fighter2", "Fighter1 vs. Fighter2", "Fighter1 v Fighter2"
+        patterns = [
+            r"([A-Za-z\'\-\.\s]+?)\s+vs\.?\s+([A-Za-z\'\-\.\s]+)",
+            r"([A-Za-z\'\-\.\s]+?)\s+v\s+([A-Za-z\'\-\.\s]+)",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                f1 = match.group(1).strip()
+                f2 = match.group(2).strip()
+
+                # Убираем лишние слова
+                for word in ["UFC", "PFL", "Bellator", "Fight Night", "Main Event", ":", "-"]:
+                    f1 = f1.replace(word, "").strip()
+                    f2 = f2.replace(word, "").strip()
+
+                if f1 and f2 and len(f1) > 2 and len(f2) > 2:
+                    # Определяем title fight
+                    is_title = "title" in text.lower() or "championship" in text.lower()
+
+                    # Ищем весовую категорию
+                    weight_class = ""
+                    weight_patterns = [
+                        r"(Lightweight|Welterweight|Middleweight|Heavyweight|Featherweight|Bantamweight|Flyweight|Light Heavyweight|Strawweight|Women's)",
+                    ]
+                    for wp in weight_patterns:
+                        wm = re.search(wp, text, re.IGNORECASE)
+                        if wm:
+                            weight_class = wm.group(1)
+                            break
+
+                    return Fight(
+                        fighter1=f1,
+                        fighter2=f2,
+                        weight_class=weight_class,
+                        is_title_fight=is_title
+                    )
+
+        return None
+
     async def fetch_all_events(self) -> list[Event]:
         """Получает события со всех лиг параллельно."""
         tasks = [
@@ -243,12 +348,13 @@ class MMAScraper:
         return all_events
 
 
-async def get_upcoming_events(leagues: list[str] = None) -> list[Event]:
+async def get_upcoming_events(leagues: list[str] = None, fetch_details: bool = True) -> list[Event]:
     """
     Получает предстоящие события MMA.
 
     Args:
         leagues: Список лиг для получения (по умолчанию все)
+        fetch_details: Загружать ли детали событий (main event)
     """
     async with MMAScraper() as scraper:
         if leagues:
@@ -267,5 +373,17 @@ async def get_upcoming_events(leagues: list[str] = None) -> list[Event]:
 
         # Сортируем по дате
         upcoming.sort(key=lambda e: e.date)
+
+        # Загружаем детали для первых N событий
+        if fetch_details and upcoming:
+            # Загружаем детали для первых 5 событий параллельно
+            events_to_fetch = upcoming[:5]
+            detail_tasks = [scraper.fetch_event_details(e) for e in events_to_fetch]
+            detailed_events = await asyncio.gather(*detail_tasks, return_exceptions=True)
+
+            # Заменяем события с деталями
+            for i, result in enumerate(detailed_events):
+                if isinstance(result, Event):
+                    upcoming[i] = result
 
         return upcoming
