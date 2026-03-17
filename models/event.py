@@ -70,30 +70,33 @@ class Event:
             fights=fights
         )
 
-    def format_message(self, timezone_str: str = "CET") -> str:
+    def format_message(self, region: str = "US") -> str:
         """Форматирует событие для отправки в Telegram."""
         from zoneinfo import ZoneInfo
-        from config import MMA_LEAGUES
+        from config import MMA_LEAGUES, STREAMING_BY_REGION, TIMEZONE_BY_REGION
 
-        tz = ZoneInfo(timezone_str)
+        # Таймзона по региону
+        tz_str = TIMEZONE_BY_REGION.get(region, "America/New_York")
+        tz = ZoneInfo(tz_str)
         local_date = self.date.astimezone(tz)
 
+        # Название таймзоны
+        tz_names = {"America/New_York": "ET", "Europe/Berlin": "CET", "Europe/Moscow": "MSK"}
+        tz_name = tz_names.get(tz_str, tz_str)
+
         # Форматирование даты
-        months = [
-            "", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
-        ]
+        months = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
         date_str = f"{local_date.day} {months[local_date.month]} {local_date.year}"
         time_str = local_date.strftime("%H:%M")
 
-        # Определяем название таймзоны
-        tz_name = "CET" if timezone_str in ("CET", "Europe/Berlin", "Europe/Paris") else timezone_str
-
-        # Получаем инфо о лиге
+        # Инфо о лиге
         league_info = MMA_LEAGUES.get(self.league, {})
         emoji = league_info.get("emoji", "🥊")
-        watch_list = league_info.get("watch", [])
         official_url = league_info.get("official_url", "")
+
+        # Стриминг по региону
+        region_streaming = STREAMING_BY_REGION.get(region, {})
+        watch_list = region_streaming.get(self.league, [])
 
         lines = [
             f"{emoji} <b>{self.name}</b>",
@@ -123,7 +126,7 @@ class Event:
         if watch_list:
             lines.extend([
                 "",
-                "📺 <b>Where to watch:</b>",
+                "📺 <b>Watch:</b>",
                 " | ".join(watch_list)
             ])
 
@@ -144,6 +147,64 @@ class Event:
 
     def hours_until(self) -> float:
         """Возвращает количество часов до события."""
-        now = datetime.now(self.date.tzinfo)
-        delta = self.date - now
+        from datetime import timezone
+        now = datetime.now(timezone.utc)
+        if self.date.tzinfo is None:
+            event_date = self.date.replace(tzinfo=timezone.utc)
+        else:
+            event_date = self.date
+        delta = event_date - now
         return delta.total_seconds() / 3600
+
+    def format_countdown(self) -> str:
+        """Форматирует countdown до события."""
+        hours = self.hours_until()
+
+        if hours <= 0:
+            return "🔴 Event is LIVE or finished!"
+
+        days = int(hours // 24)
+        remaining_hours = int(hours % 24)
+        minutes = int((hours % 1) * 60)
+
+        parts = []
+        if days > 0:
+            parts.append(f"{days}d")
+        if remaining_hours > 0:
+            parts.append(f"{remaining_hours}h")
+        if minutes > 0 and days == 0:  # показываем минуты только если меньше дня
+            parts.append(f"{minutes}m")
+
+        return f"⏱ {' '.join(parts)}"
+
+    def generate_ics(self) -> str:
+        """Генерирует ICS файл для события."""
+        from datetime import timedelta
+
+        # ICS формат
+        lines = [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "PRODID:-//MMA Bot//mmabot//EN",
+            "BEGIN:VEVENT",
+            f"UID:{self.id}@mmabot",
+            f"DTSTAMP:{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}",
+            f"DTSTART:{self.date.strftime('%Y%m%dT%H%M%SZ')}",
+            f"DTEND:{(self.date + timedelta(hours=4)).strftime('%Y%m%dT%H%M%SZ')}",
+            f"SUMMARY:{self.name}",
+        ]
+
+        if self.location:
+            lines.append(f"LOCATION:{self.location}")
+
+        description = f"League: {self.league}"
+        if self.main_event:
+            description += f"\\nMain Event: {self.main_event.fighter1} vs {self.main_event.fighter2}"
+        if self.url:
+            description += f"\\nMore info: {self.url}"
+
+        lines.append(f"DESCRIPTION:{description}")
+        lines.append("END:VEVENT")
+        lines.append("END:VCALENDAR")
+
+        return "\r\n".join(lines)
