@@ -78,6 +78,11 @@ class FighterCache:
         self.cache[key] = fighter.to_dict()
         self._save()
 
+    def clear(self):
+        """Очищает кэш."""
+        self.cache = {}
+        self._save()
+
 
 # Глобальный кэш
 fighter_cache = FighterCache()
@@ -87,8 +92,8 @@ class FighterScraper:
     """Парсер данных о бойцах."""
 
     HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     }
 
     def __init__(self):
@@ -106,16 +111,15 @@ class FighterScraper:
         """Получает данные бойца (из кэша или парсит)."""
         # Проверяем кэш
         cached = fighter_cache.get(name)
-        if cached:
+        if cached and cached.photo_url:  # Только если есть фото
             return cached
 
         # Парсим с UFCStats
         fighter = await self._search_ufcstats(name)
 
         if fighter:
-            # Пробуем получить фото с UFC.com
-            if not fighter.photo_url:
-                fighter.photo_url = await self._get_ufc_photo(name)
+            # Получаем фото с Sherdog
+            fighter.photo_url = await self._get_fighter_photo(name)
 
             fighter_cache.set(fighter)
             return fighter
@@ -128,26 +132,28 @@ class FighterScraper:
             return None
 
         try:
-            # Поиск
-            search_url = f"http://ufcstats.com/statistics/fighters/search?query={quote(name)}"
-            async with self.session.get(search_url) as response:
-                if response.status != 200:
-                    return None
+            # Try full name first, then first name only
+            search_terms = [name]
+            if " " in name:
+                search_terms.append(name.split()[0])  # First name
 
-                html = await response.text()
-                soup = BeautifulSoup(html, "lxml")
+            for term in search_terms:
+                search_url = f"http://ufcstats.com/statistics/fighters/search?query={quote(term)}"
+                async with self.session.get(search_url) as response:
+                    if response.status != 200:
+                        continue
 
-                # Ищем ссылку на бойца
-                fighter_link = soup.select_one("a.b-link_style_black")
-                if not fighter_link:
-                    return None
+                    html = await response.text()
+                    soup = BeautifulSoup(html, "lxml")
 
-                fighter_url = fighter_link.get("href")
-                if not fighter_url:
-                    return None
+                    # Find links to fighter detail pages
+                    all_links = soup.select("a.b-link_style_black")
+                    for link in all_links:
+                        href = link.get("href", "")
+                        if "fighter-details" in href:
+                            return await self._parse_fighter_page(href)
 
-                # Получаем страницу бойца
-                return await self._parse_fighter_page(fighter_url)
+            return None
 
         except Exception as e:
             logger.error(f"Error searching UFCStats for {name}: {e}")
@@ -166,26 +172,22 @@ class FighterScraper:
                 html = await response.text()
                 soup = BeautifulSoup(html, "lxml")
 
-                # Имя
                 name_elem = soup.select_one("span.b-content__title-highlight")
                 if not name_elem:
                     return None
                 name = name_elem.get_text(strip=True)
 
-                # Никнейм
                 nickname = ""
                 nick_elem = soup.select_one("p.b-content__Nickname")
                 if nick_elem:
                     nickname = nick_elem.get_text(strip=True).strip('"')
 
-                # Рекорд
                 record_elem = soup.select_one("span.b-content__title-record")
                 record = "0-0-0"
                 wins, losses, draws = 0, 0, 0
 
                 if record_elem:
                     record_text = record_elem.get_text(strip=True)
-                    # Format: "Record: 26-1-0"
                     match = re.search(r"(\d+)-(\d+)-(\d+)", record_text)
                     if match:
                         wins = int(match.group(1))
@@ -193,7 +195,6 @@ class FighterScraper:
                         draws = int(match.group(3))
                         record = f"{wins}-{losses}-{draws}"
 
-                # Детали (height, weight, reach)
                 height = ""
                 reach = ""
                 weight_class = ""
@@ -224,38 +225,68 @@ class FighterScraper:
             logger.error(f"Error parsing fighter page: {e}")
             return None
 
-    async def _get_ufc_photo(self, name: str) -> str:
-        """Пробует получить URL фото с UFC.com."""
+    async def _get_fighter_photo(self, name: str) -> str:
+        """Получает URL фото бойца с Sherdog."""
         if not self.session:
             return ""
 
         try:
-            # UFC.com использует формат имени в URL
-            # https://www.ufc.com/athlete/islam-makhachev
-            slug = name.lower().replace(" ", "-").replace("'", "")
-            url = f"https://www.ufc.com/athlete/{slug}"
+            # Поиск бойца на Sherdog
+            search_url = f"https://www.sherdog.com/stats/fightfinder?SearchTxt={quote(name)}"
 
-            async with self.session.get(url) as response:
+            async with self.session.get(search_url, allow_redirects=True) as response:
                 if response.status != 200:
                     return ""
 
                 html = await response.text()
-                soup = BeautifulSoup(html, "lxml")
 
-                # Ищем фото
-                img = soup.select_one("div.hero-profile__image img")
-                if img and img.get("src"):
-                    return img["src"]
+                # Ищем ссылку на страницу бойца
+                last_name = name.split()[-1].lower()
+                pattern = rf'/fighter/[^"\']+{last_name}[^"\'\s]*'
+                match = re.search(pattern, html, re.IGNORECASE)
 
-                # Альтернативный селектор
-                img = soup.select_one("img.image-style-athlete-profile")
-                if img and img.get("src"):
-                    return img["src"]
+                if not match:
+                    logger.debug(f"Fighter {name} not found on Sherdog")
+                    return ""
+
+                fighter_path = match.group(0)
+                fighter_url = f"https://www.sherdog.com{fighter_path}"
+
+                # Получаем страницу бойца
+                async with self.session.get(fighter_url, allow_redirects=True) as resp:
+                    if resp.status != 200:
+                        return ""
+
+                    fighter_html = await resp.text()
+
+                    # Способ 1: og:image meta tag
+                    og_match = re.search(r'og:image"\s+content="([^"]+_images/fighter/[^"]+\.(?:jpg|png|JPG|PNG))"', fighter_html)
+                    if og_match:
+                        photo_path = og_match.group(1)
+                        if not photo_path.startswith('http'):
+                            photo_url = f"https://www.sherdog.com{photo_path}"
+                        else:
+                            photo_url = photo_path
+                        logger.debug(f"Found Sherdog og:image for {name}: {photo_url}")
+                        return photo_url
+
+                    # Способ 2: itemprop="image" img tag
+                    img_match = re.search(r'itemprop="image"\s+src="([^"]+)"', fighter_html)
+                    if img_match:
+                        photo_path = img_match.group(1)
+                        if not photo_path.startswith('http'):
+                            photo_url = f"https://www.sherdog.com{photo_path}"
+                        else:
+                            photo_url = photo_path
+                        logger.debug(f"Found Sherdog itemprop image for {name}: {photo_url}")
+                        return photo_url
+
+                    logger.debug(f"No photo on Sherdog for {name}")
+                    return ""
 
         except Exception as e:
-            logger.debug(f"Could not get UFC photo for {name}: {e}")
-
-        return ""
+            logger.debug(f"Error getting Sherdog photo for {name}: {e}")
+            return ""
 
 
 async def get_fighter_info(name: str) -> Optional[Fighter]:
