@@ -5,12 +5,13 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, BufferedInputFile
 
 from services.mma_scraper import get_upcoming_events
+from services.card_generator import generate_main_event_card
 from storage.json_storage import SubscriberStorage, ALL_LEAGUES
 from bot.keyboards import (
     get_main_keyboard, get_event_inline_keyboard,
     get_settings_keyboard, get_region_keyboard
 )
-from config import MMA_LEAGUES, REGION_NAMES
+from config import MMA_LEAGUES, REGION_NAMES, TIMEZONE_BY_REGION
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -51,6 +52,7 @@ async def cmd_start(message: Message):
             "/events — all upcoming events\n"
             "/ufc /pfl /bellator — events by league\n"
             "/countdown — next event countdown\n"
+            "/card — main event fight card image\n"
             "/settings — notification settings\n"
             "/subscribe /unsubscribe — notifications\n\n"
             "Use buttons below 👇"
@@ -178,6 +180,72 @@ async def cmd_countdown(message: Message):
     except Exception as e:
         logger.error(f"Error in countdown: {e}")
         await message.answer("❌ Error loading event. Try again later.")
+
+
+# === Fight Card ===
+
+@router.message(Command("card"))
+@router.message(F.text == "🎴 Card")
+async def cmd_card(message: Message):
+    """Генерирует карточку главного боя следующего события."""
+    chat_id = message.chat.id
+    region = subscriber_storage.get_region(chat_id)
+    user_leagues = subscriber_storage.get_leagues(chat_id)
+
+    loading_msg = await message.answer("🎴 Generating fight card...")
+
+    try:
+        events = await get_upcoming_events(leagues=user_leagues if user_leagues else None)
+
+        if not events:
+            await loading_msg.edit_text("😔 No upcoming events found.")
+            return
+
+        next_event = events[0]
+
+        # Проверяем, есть ли main event
+        if not next_event.main_event:
+            await loading_msg.edit_text(
+                f"😔 No main event info available for {next_event.name}.\n"
+                "Try /events for event list."
+            )
+            return
+
+        # Форматируем дату
+        from zoneinfo import ZoneInfo
+        tz_str = TIMEZONE_BY_REGION.get(region, "America/New_York")
+        tz = ZoneInfo(tz_str)
+        local_date = next_event.date.astimezone(tz)
+
+        tz_names = {"America/New_York": "ET", "Europe/Berlin": "CET", "Europe/Moscow": "MSK"}
+        tz_name = tz_names.get(tz_str, tz_str)
+
+        date_str = local_date.strftime(f"%b %d, %Y • %H:%M {tz_name}")
+
+        # Генерируем карточку
+        card_bytes = await generate_main_event_card(
+            event_name=next_event.name,
+            event_date=date_str,
+            fighter1_name=next_event.main_event.fighter1,
+            fighter2_name=next_event.main_event.fighter2,
+            weight_class=next_event.main_event.weight_class,
+            is_title_fight=next_event.main_event.is_title_fight
+        )
+
+        # Отправляем как фото
+        photo = BufferedInputFile(card_bytes, filename="fight_card.png")
+
+        await message.answer_photo(
+            photo,
+            caption=f"🥊 <b>{next_event.name}</b>\n{next_event.format_countdown()}",
+            parse_mode="HTML"
+        )
+
+        await loading_msg.delete()
+
+    except Exception as e:
+        logger.error(f"Error generating card: {e}")
+        await loading_msg.edit_text("❌ Error generating fight card. Try again later.")
 
 
 # === Calendar ICS ===

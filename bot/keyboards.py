@@ -9,7 +9,7 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
     """Главная клавиатура бота."""
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📅 Events"), KeyboardButton(text="⏱ Countdown")],
+            [KeyboardButton(text="📅 Events"), KeyboardButton(text="⏱ Countdown"), KeyboardButton(text="🎴 Card")],
             [KeyboardButton(text="🥊 UFC"), KeyboardButton(text="🏆 PFL"), KeyboardButton(text="🔔 Bellator")],
             [KeyboardButton(text="⚙️ Settings")],
         ],
